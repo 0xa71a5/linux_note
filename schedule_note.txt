@@ -1,0 +1,176 @@
+===================================================================================================
+线程唤醒的全流程
+===================================================================================================
+wake_up_process -> try_to_wake_up
+	|--> cpu = select_task_rq // 负载均衡，选择一个合适的CPU
+	|	|--> p->sched_class->select_task_rq
+	|
+	|--> if task_cpu(p) != cpu // 目标cpu不等于旧的cpu时, 任务发生迁移(migrate)
+	|	|--> set_task_cpu(p, cpu)
+	|		|--> p->sched_class->migrate_task_rq(p, cpu)
+	|		|--> set_task_rq(p, cpu)
+	|		|--> p->cpu = cpu
+	|		|--> p->wake_cpu = cpu
+	|
+	|--> ttwu_queue
+		|--> if sched_feat(TTWU_QUEUE) && !cpus_share_cache(smp_processor_id(), cpu)) //???
+		|	|--> ttwu_queue_remote
+		|	|--> return
+		|
+		|--> ttwu_do_activate
+				|
+				|    // 这里主要是将新任务p加入到对应rq的运行队列中, 单纯加入rq并不一定能让任务p
+				|    // 正常跑起来，还需要一个kickup的动作来通知对应cpu
+				|    // 这个动作在接下来的 ttwu_do_wakeup中进行
+				|--> ttwu_activate(rq, p, en_flags);
+				|	|--> activate_task
+				|		|--> enqueue_task(scheduler specific)
+				|
+				|    // 这里主要是处理p如果抢占rq->curr的一系列事宜
+				|--> ttwu_do_wakeup(rq, p, wake_flags, rf);
+					|
+					|--> check_preempt_curr	// 检查p是否可以抢占当前进程rq->curr
+					|	|
+					|	|    // 如果两个线程的调度类相同，那么调用该调度类自己的比较方法
+					|	|--> if p->sched_class == rq->curr->sched_class
+					|	|	|--> sched_class->check_preempt_curr()
+					|	|
+					|	|    // 如果调度器不同，那么按照调度其优先级比较，高优先级调度器线程
+					|	|    // 可以抢占低优先级调度器所属线程
+					|	|--> iterate and compare priority of sched class
+					|		|--> if rq->curr has higher priority
+					|		|	do nothing and break
+					|		|
+					|		|--> if p has higher priority // 新的任务可以抢占当前任务
+					|			|--> resched_curr(rq) // 标记当前任务需要被调度出去
+					|				|--> if thread_info(rq->curr)->flag has TIF_NEED_RESCHED
+					|				|	just return
+					|				|
+					|				|--> if current_cpu_id == rq's cpu id
+					|				|	|--> set_tsk_need_resched // set TIF_NEED_RESCHED
+					|				|	|--> set_preempt_need_resched // almost do nothing
+					|				|	|--> return
+					|				|
+					|				|    // 走到这里的时候，rq已经确认在另外一个cpu上, 并且那个cpu
+					|				|    // 当前没有被标记 need resched flag
+					|				|    // 所以 需要给目标cpu标记resched flag和发送IPI中断CPU
+					|				|    // 发送IPI的目的是为了让目标cpu立刻响应这个reschedule
+					|				|--> if set_nr_and_not_polling // 不太明白x86的实现
+					|					|--> set_tsk_need_resched
+					|					|--> smp_send_reschedule
+					|
+					|    // 目标任务接下来将会被放到run queue中，所以状态肯定要设置成RUNNING
+					|--> p->state = TASK_RUNNING
+					|
+					|    // 如下是在RT调度器中一系列对是否要执行 task push 的判断
+					|    // task push 是为了将本cpu的rt任务推到别的cpu执行，提高实时性
+					|    // push的核心约束条件是 本cpu有超过1个RT任务在排队等候执行，并且别的cpu有
+					|    // 低优先级任务可以被抢占 或者 别的cpu处于空闲状态
+					|--> p->sched_class->task_woken(rq, p) 
+						|--> if p is not running in any cpu		 // !task_running(rq, p)
+						     && rq->curr doesn't need reschedule	 // !test_tsk_need_resched(rq->curr)
+						     && p is allowed to running in multiple cpus // p->nr_cpus_allowed > 1
+						     && rq->curr is sched by deadline or rt      //dl_task(rq->curr)||rt_task(rq->curr)
+						     && (rq->curr's nr_cpus_allowed is 1 or 0  	 // rq->curr->nr_cpus_allowed < 2
+							 || rq->curr has higher priority than p)
+								|
+								|--> push_rt_tasks(rq)
+									|--> next_task = pick_next_pushable_task(rq)
+									|--> deactivate_task(rq, next_task, 0)
+									|--> set_task_cpu(next_task, lowest_rq->cpu)
+									|--> activate_task(lowest_rq, next_task, 0)
+
+
+
+
+
+#define TASK_RUNNING			0x0000
+#define TASK_INTERRUPTIBLE		0x0001
+#define TASK_UNINTERRUPTIBLE		0x0002
+
+schdule
+|--> sched_submit_work
+|	|--> if blk_needs_flush_plug
+|		|--> blk_schedule_flush_plug
+|--> preempt_disable
+|--> __schedule(false)
+	|--> hrtick_clear	// 清除hrtick, hrtick在这里用来做精准调度
+	|--> local_irq_disable
+	|--> rq_lock
+	|--> rq->clock_update_flags <<= 1
+	|--> update_rq_clock
+	|--> if is not preempt and prev->state is running
+	|	|--> if prev has signal pending
+	|	|	|--> prev->state = TASK_RUNNING
+	|	|--> else
+	|		|--> deactivate_task
+	|		|	|--> dequeue_task
+	|		|		|--> p->sched_class->dequeue_task
+	|		|--> prev->on_rq = 0
+	|		|--> if prev is in_iowait
+	|		|	|--> delayacct_blkio_start
+	|		|--> if prev is kworker
+	|			|--> if wq_worker_sleeping(prev)
+	|				|--> try_to_wake_up_local
+	|--> next = pick_next_task
+	|	|--> for_each_class // 从高优先级调度器到低优先级调度器，依次看是否有可以运行任务
+	|		|--> p = class->pick_next_task
+	|--> clear_tsk_need_resched // 调用clear_bit，将 TIF_NEED_RESCHED 清除掉
+	|--> rq->curr = next
+	|--> rq = context_switch // 上下文切换主要在这里面发生
+		|--> mm = next->mm
+		|--> oldmm = prev->active_mm
+		|--> arch_start_context_switch // arm没有实现对应操作
+		|--> if (!mm) // next是一个内核线程
+		|	|--> next->active_mm = oldmm
+		|	|--> enter_lazy_tlb
+		|--> else // next是一个用户线程
+		|	|--> switch_mm_irqs_off (调用各arch实现的 switch_mm)
+		|		|--> __flush_iache_all && cpumask_clear_cpu
+		|
+		|--> if prev->mm is NULL
+		|	|--> prev->active_mm = NULL
+		|	|--> rq->prev_mm = oldmm
+		|
+		|--> switch_to(prev, next, prev) // 如下是 ARM 的实现
+			|--> __complete_pending_tlbi
+				|--> dsb(ish)
+			|--> __switch_to(prev, task_thread_info(prev), task_thread_info(next))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
